@@ -1,0 +1,107 @@
+name: Sync latest release (separate commits per repo)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-releases
+  cancel-in-progress: false
+
+jobs:
+  sync-all:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Read repos.txt and sync latest release
+        run: |
+          set -x
+          set -e
+          trap 'echo "Error on line $LINENO, exit code $?"' ERR
+
+          if [ ! -f repos.txt ]; then
+            echo "ERROR: repos.txt not found."
+            exit 1
+          fi
+
+          grep -v '^#' repos.txt | grep -v '^[[:space:]]*$' | while IFS='|' read -r repo_path filter_pattern; do
+            repo_path=$(echo "$repo_path" | xargs)
+            filter_pattern=$(echo "$filter_pattern" | xargs)
+
+            echo "========================================="
+            echo "Repo: $repo_path"
+            echo "Filter: $filter_pattern"
+
+            owner=$(echo "$repo_path" | cut -d'/' -f1)
+            repo_name=$(echo "$repo_path" | cut -d'/' -f2)
+            target_dir="releases/$owner/$repo_name"
+            mkdir -p "$target_dir"
+
+            latest_json=$(curl -s --fail "https://api.github.com/repos/$repo_path/releases/latest")
+            if echo "$latest_json" | grep -q '"message": "Not Found"'; then
+              echo "  No releases found, skipping."
+              continue
+            fi
+
+            tag=$(echo "$latest_json" | jq -r '.tag_name')
+            prerelease=$(echo "$latest_json" | jq -r '.prerelease')
+            date_raw=$(echo "$latest_json" | jq -r '.published_at')
+            status="stable"
+            [[ "$prerelease" == "true" ]] && status="prerelease"
+
+            stored_tag=""
+            if [ -f "$target_dir/release.json" ]; then
+              stored_tag=$(jq -r '.tag' "$target_dir/release.json" 2>/dev/null || echo "")
+            fi
+
+            if [ "$stored_tag" = "$tag" ]; then
+              echo "  Already up to date: $tag"
+              continue
+            fi
+
+            echo "  New release: $tag (previous: $stored_tag)"
+            find "$target_dir" -type f ! -name 'release.json' -delete 2>/dev/null || true
+
+            echo "  Downloading matching assets (skipping files >100 MB)..."
+            # Use a process substitution to avoid subshell issues with variables
+            while read -r url; do
+              filename=$(basename "$url")
+              # Get final Content-Length after following redirects
+              size=$(curl -sL -I "$url" | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r')
+              # If size is empty, we assume file is small enough (or fallback to download)
+              if [ -n "$size" ] && [ "$size" -gt 104857600 ]; then
+                echo "    SKIP $filename – $size bytes (>100 MB)"
+                continue
+              fi
+              echo "    Downloading $filename (size: ${size:-unknown})"
+              wget -q --show-progress "$url" -P "$target_dir"
+            done < <(curl -s "https://api.github.com/repos/$repo_path/releases/tags/$tag" \
+              | jq -r --arg pat "$filter_pattern" '.assets[].browser_download_url | select(test($pat; "i"))')
+
+            # Write release.json (always, even if no assets were downloaded)
+            printf '{\n' > "$target_dir/release.json"
+            printf '  "tag": "%s",\n' "$tag" >> "$target_dir/release.json"
+            printf '  "status": "%s",\n' "$status" >> "$target_dir/release.json"
+            printf '  "published_at": "%s",\n' "$date_raw" >> "$target_dir/release.json"
+            printf '  "filter_pattern": "%s",\n' "$filter_pattern" >> "$target_dir/release.json"
+            printf '  "updated_at": "%s"\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$target_dir/release.json"
+            printf '}\n' >> "$target_dir/release.json"
+
+            git add "$target_dir"
+            git commit -m "Update $repo_path to $tag"
+            git pull --rebase origin HEAD
+            git push
+            echo "  Committed $repo_path update."
+          done
